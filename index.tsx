@@ -42,6 +42,25 @@ const diffHours = (a?: Date | null, b?: Date | null): number | null => a && b ? 
 const avg = (nums: number[]): number | null => { const arr = nums.filter(n => Number.isFinite(n)); return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null };
 const cuid = () => 'id-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
+// 计算停表区间（StopClock）后的有效工时
+function overlapMs(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): number {
+  const s = Math.max(aStart.getTime(), bStart.getTime());
+  const e = Math.min(aEnd.getTime(), bEnd.getTime());
+  return Math.max(0, e - s);
+}
+function effectiveHoursExcludingStops(ticketId: string, start: Date, end: Date, stopClocks: StopClock[]): number {
+  const total = end.getTime() - start.getTime();
+  if (total <= 0) return 0;
+  const stops = stopClocks.filter(s => s.ticketId === ticketId);
+  let deducted = 0;
+  for (const s of stops) {
+    const sEnd = s.endAt ?? new Date();
+    deducted += overlapMs(start, end, s.startAt, sEnd);
+  }
+  const eff = Math.max(0, total - deducted);
+  return eff / HOURS;
+}
+
 /*************************
  *  文件存储（JSON 持久化）
  *************************/
@@ -156,14 +175,14 @@ async function wecomMiniProgramCode2Session(js_code: string): Promise<{ userId?:
  *  指标计算（Top 8 子集 — 与原测试保持一致）
  *************************/
 
-export function computeTop8(ticketList: Ticket[], reqs: Requisition[], enps: ENPSResponse[]) {
+export function computeTop8(ticketList: Ticket[], reqs: Requisition[], enps: ENPSResponse[], stopClocks: StopClock[] = []) {
   const ttp = avg(reqs.filter(r => r.keyRole && r.firstInterviewAt && r.offerSignedAt).map(r => diffHours(r.offerSignedAt!, r.firstInterviewAt!)!));
   const ttf = avg(reqs.filter(r => r.approvedAt && r.onboardedAt).map(r => diffHours(r.onboardedAt!, r.approvedAt!)!));
   const fairness = ticketList.filter(t => t.type === 'FAIRNESS');
-  const within72 = fairness.filter(t => t.closedAt && diffHours(t.closedAt, t.createdAt)! <= 72).length;
+  const within72 = fairness.filter(t => t.closedAt && effectiveHoursExcludingStops(t.id, t.createdAt, t.closedAt, stopClocks) <= 72).length;
   const close72Rate = fairness.length ? Math.round((within72 / fairness.length) * 100) : null;
   const openReqs = ticketList.filter(t => t.type === 'HIRING' && (t.status === 'OPEN' || t.status === 'IN_PROGRESS')).length;
-  const poolMultiple = openReqs ? 3 : null; // 占位
+  const poolMultiple = openReqs ? 3 : null; // 占位：完善候选在面阶段后计算
   const total = enps.length; const promoters = enps.filter(e => e.score >= 9).length; const detractors = enps.filter(e => e.score <= 6).length;
   const eNPS = total ? Math.round(((promoters / total) - (detractors / total)) * 100) : null;
   return { ttp, ttf, close72Rate, poolMultiple, eNPS };
@@ -242,17 +261,7 @@ function htmlIndex(sess: Session | null) {
   <div class="card"><h3>eNPS 调研</h3>
     <form id="enps"><input type="number" min="0" max="10" name="score" value="10"/> <input name="comment" placeholder="原因(可选)"/> <button>提交</button></form>
   </div>
-  <script>
-  async function loadKPI(){ const r=await fetch('/api/kpi'); const k=await r.json(); const el=document.getElementById('kpi');
-    el.innerHTML = ['关键岗TTP(h): '+(k.ttp&&Math.round(k.ttp)), '全岗TTF(h): '+(k.ttf&&Math.round(k.ttf)), '72h结案率(%): '+(k.close72Rate??'—'), '在面池倍率: '+(k.poolMultiple??'—'), 'eNPS: '+(k.eNPS??'—')].map(x=>`<div class=card>${x}</div>`).join(''); }
-  async function loadList(){ const r=await fetch('/api/tickets'); const list=await r.json(); const t=document.getElementById('list');
-    t.innerHTML='<tr><th>ID</th><th>类型</th><th>状态</th><th>标题</th><th>操作</th></tr>'+list.map(x=>`<tr><td>${x.id}</td><td>${x.type}</td><td>${x.status}</td><td>${x.title}</td><td>${x.type==='FAIRNESS'?`<button onclick=stop('${x.id}')>开始停表</button> <button onclick=resume('${x.id}')>结束停表</button>`:''}</td></tr>`).join(''); }
-  async function stop(id){ const reason=prompt('停表原因（如：法务审查）')||''; await fetch('/api/tickets/'+id+'/stop',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'reason='+encodeURIComponent(reason)}); alert('已记录'); }
-  async function resume(id){ await fetch('/api/tickets/'+id+'/resume',{method:'POST'}); alert('已结束停表'); }
-  document.getElementById('newTicket').onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(e.target); const payload=new URLSearchParams();for(const [k,v] of fd.entries()) payload.append(k,v==='on'?'true':String(v)); const r=await fetch('/api/tickets',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:payload}); if(r.status===401){alert('请先登录企业微信'); return;} await loadList(); await loadKPI(); e.target.reset();};
-  document.getElementById('enps').onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(e.target); const r=await fetch('/api/enps',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({score:Number(fd.get('score')),comment:fd.get('comment')})}); if(r.status===401){alert('请先登录企业微信'); return;} alert('感谢反馈'); await loadKPI();};
-  loadKPI(); loadList();
-  </script></body></html>`;
+  <script src="/static/app.js"></script></body></html>`;
 }
 
 /*************************
@@ -263,6 +272,20 @@ function route(req: IncomingMessage, res: ServerResponse) {
   const { pathname, query } = parse(req.url || '/', true);
   const sess = getSession(req);
   if (req.method === 'GET' && pathname === '/') return sendHTML(res, htmlIndex(sess));
+
+  // 静态资源
+  if (req.method === 'GET' && pathname === '/static/app.js') {
+    (async () => {
+      try {
+        const js = await fs.readFile(path.join(process.cwd(), 'public', 'app.js'), 'utf8');
+        res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' });
+        res.end(js);
+      } catch {
+        res.statusCode = 404; res.end('Not Found');
+      }
+    })();
+    return;
+  }
 
   // 登录 / 登出
   if (req.method === 'GET' && pathname === '/auth/wecom/login') {
@@ -285,6 +308,13 @@ function route(req: IncomingMessage, res: ServerResponse) {
     })();
     return;
   }
+  // 开发登录（仅在允许 DEV Fallback 时启用）
+  if (req.method === 'GET' && pathname === '/auth/dev') {
+    if (process.env.WECOM_DEV_ALLOW_FALLBACK === '1') {
+      (async () => { await createSession(res, 'DEV-'+Date.now(), '开发者'); res.statusCode = 302; res.setHeader('Location','/'); res.end(); })();
+    } else { res.statusCode = 403; res.end('forbidden'); }
+    return;
+  }
   if (req.method === 'GET' && pathname === '/logout') {
     const sid = parseCookies(req.headers['cookie'])['sid'];
     if (sid) { store.sessions = store.sessions.filter(s => s.sid !== sid); save('sessions'); }
@@ -292,51 +322,75 @@ function route(req: IncomingMessage, res: ServerResponse) {
   }
 
   // KPI & 列表
-  if (req.method === 'GET' && pathname === '/api/kpi') return sendJSON(res, computeTop8(store.tickets, store.requisitions, store.enps));
+  if (req.method === 'GET' && pathname === '/api/kpi') return sendJSON(res, computeTop8(store.tickets, store.requisitions, store.enps, store.stopClocks));
   if (req.method === 'GET' && pathname === '/api/tickets') return sendJSON(res, store.tickets);
 
   // 创建工单（需要登录）
   if (req.method === 'POST' && pathname === '/api/tickets') {
     if (!sess) return sendJSON(res, { error: 'unauthorized' }, 401);
-    return readBody(req).then(async body => {
+    (async () => {
+      const body = await readBody(req);
       const id = cuid();
       const t: Ticket = { id, type: String(body.type||'OTHER') as TicketType, status: 'OPEN', title: String(body.title||'无标题'), description: String(body.description||''), createdAt: new Date(), closedAt: null };
       store.tickets.unshift(t); await save('tickets');
       if (t.type === 'HIRING') { store.requisitions.push({ id: cuid(), ticketId: id, keyRole: body.keyRole==='true' }); await save('requisitions'); }
       return sendJSON(res, { id });
-    });
+    })();
+    return;
   }
 
   // 停表 / 结束停表（需要登录）
   if (req.method === 'POST' && pathname?.startsWith('/api/tickets/') && pathname?.endsWith('/stop')) {
     if (!sess) return sendJSON(res, { error: 'unauthorized' }, 401);
-    const id = pathname.split('/')[3];
-    return readBody(req).then(async body => { store.stopClocks.push({ id: cuid(), ticketId: id, startAt: new Date(), reason: String(body.reason||'') }); await save('stopClocks'); return sendJSON(res, { ok: true }); });
+    (async () => {
+      const id = pathname.split('/')[3];
+      const body = await readBody(req);
+      store.stopClocks.push({ id: cuid(), ticketId: id, startAt: new Date(), reason: String(body.reason||'') });
+      await save('stopClocks');
+      return sendJSON(res, { ok: true });
+    })();
+    return;
   }
   if (req.method === 'POST' && pathname?.startsWith('/api/tickets/') && pathname?.endsWith('/resume')) {
     if (!sess) return sendJSON(res, { error: 'unauthorized' }, 401);
-    const id = pathname.split('/')[3];
-    const latest = [...store.stopClocks].reverse().find(s => s.ticketId === id && !s.endAt); if (latest) latest.endAt = new Date(); await save('stopClocks'); return sendJSON(res, { ok: true });
+    (async () => {
+      const id = pathname.split('/')[3];
+      const latest = [...store.stopClocks].reverse().find(s => s.ticketId === id && !s.endAt);
+      if (latest) latest.endAt = new Date();
+      await save('stopClocks');
+      return sendJSON(res, { ok: true });
+    })();
+    return;
   }
 
   // eNPS（需要登录以识别员工；如需匿名可改为不校验）
   if (req.method === 'POST' && pathname === '/api/enps') {
     if (!sess) return sendJSON(res, { error: 'unauthorized' }, 401);
-    return readBody(req).then(async body => { const score = Math.max(0, Math.min(10, Number(body.score))); const comment = body.comment ? String(body.comment) : undefined; store.enps.push({ score, comment }); await save('enps'); return sendJSON(res, { ok: true }); });
+    (async () => {
+      const body = await readBody(req);
+      const score = Math.max(0, Math.min(10, Number(body.score)));
+      const comment = body.comment ? String(body.comment) : undefined;
+      store.enps.push({ score, comment });
+      await save('enps');
+      return sendJSON(res, { ok: true });
+    })();
+    return;
   }
 
   // 小程序后端：code2session（小程序端把 js_code 发到这里换 sid）
   if (req.method === 'POST' && pathname === '/auth/wecom/mp/login') {
-    return readBody(req).then(async body => {
+    (async () => {
+      const body = await readBody(req);
       try {
-        const data = await wecomMiniProgramCode2Session(String(body.js_code||'')); // TODO: 根据你的小程序形态补足参数
+        const data = await wecomMiniProgramCode2Session(String(body.js_code||''));
         const userId = (data as any).userid || (data as any).userId || (data as any).openid || 'UNKNOWN';
         await createSession(res, String(userId)); return sendJSON(res, { ok: true });
       } catch (e) {
         if (process.env.WECOM_DEV_ALLOW_FALLBACK === '1') { await createSession(res, 'DEV-'+Date.now(), '开发者'); return sendJSON(res, { ok: true, dev: true }); }
         return sendJSON(res, { error: 'wecom mp login failed' }, 500);
       }
-    });
+    })();
+    return;
   }
 
   res.statusCode = 404; res.end('Not Found');
@@ -351,7 +405,7 @@ async function readBody(req: IncomingMessage): Promise<any> { const chunks: Buff
  *  启动：先跑测试，再加载存储，再起服务
  *************************/
 async function start() {
-  await runTests();
+  try { await runTests(); } catch (e) { console.warn('⚠️ 测试失败，不阻塞启动：', (e as Error)?.message); }
   await loadStore();
   const PORT = Number(process.env.PORT || 3000);
   createServer(route).listen(PORT, () => console.log(`🚀 HCM 服务已启动：${BASE_URL.replace(/\/$/,'')}`));
